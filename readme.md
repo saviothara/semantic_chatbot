@@ -207,3 +207,111 @@ Update the Looker tool and the Knowledge tool to load your new metadata file.
 For optimal AI performance, update the hardcoded prompts in app.py to guide the agent toward using relevant fields in your new domain.
 
 * **app.py**: Find the LOOKER\_AGENT\_PROMPT\_TEMPLATE and specifically update the **ANALYST STRATEGY** section. Guide the agent to think like an analyst in your new domain (e.g., recommend fields like orders.count, products.inventory\_level, or financials.revenue instead of census demographics).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  sequenceDiagram
+      participant User as Google Chat User
+      participant Bot as EAP Chat Bot<br/>(Cloud Run Function Gen 2)<br/>Project: cte-dse-g-chat-bot-np
+      participant LLM as Gemini 2.5-Flash<br/>(LangGraph ReAct Agent)
+      participant Meta as GCP Metadata Server<br/>(metadata.google.internal)
+      participant Google as Google Auth<br/>(accounts.google.com)
+      participant IAP as Identity-Aware Proxy<br/>(Org brand: project 369001918367)
+      participant Agent as DataHub 2.0 Pipeline Agent<br/>(Cloud Run - Skipper A2A)<br/>Project: cio-eap-n8n-automation-np
+
+      Note over User, Agent: 1. USER SENDS MESSAGE
+
+      User->>Bot: "What pipelines exist in DataHub?"
+      Bot->>LLM: invoke(messages)
+      LLM->>LLM: ReAct reasoning:<br/>"This is about DataHub 2.0,<br/>I should use pipeline_agent tool"
+      LLM-->>Bot: Tool call: pipeline_agent("What pipelines exist?")
+
+      Note over Bot, Agent: 2. JWT TOKEN GENERATION
+
+      Bot->>Bot: _get_iap_headers() called
+      Bot->>Bot: Check PIPELINE_AGENT_IAP_CLIENT_ID env var
+
+      alt Primary: id_token.fetch_id_token (Gen 2)
+          Bot->>Meta: GET
+  /computeMetadata/v1/instance/<br/>service-accounts/default/identity<br/>?audience=369001918367-...apps.googleusercontent.com<br/>Header: Metadata-Flavor:
+  Google
+          Meta->>Google: "SA g-chat-service-account@...<br/>needs ID token for audience 369001918367-..."
+          Google->>Google: Verify SA identity<br/>Create JWT:<br/>  iss: accounts.google.com<br/>  sub: 105633110857141712042<br/>  aud:
+  369001918367-...<br/>  exp: +1 hour<br/>Sign with Google private key
+          Google-->>Meta: Signed JWT (eyJhbG...)
+          Meta-->>Bot: JWT token
+      else Fallback: Metadata server directly
+          Bot->>Meta: GET /computeMetadata/v1/instance/<br/>service-accounts/default/identity<br/>?audience=369001918367-...<br/>Header: Metadata-Flavor:
+  Google
+          Meta-->>Bot: JWT token
+      end
+
+      Bot->>Bot: Set header:<br/>Authorization: Bearer eyJhbG...
+
+      Note over Bot, Agent: 3. A2A TASK CREATION (through IAP)
+
+      Bot->>IAP: POST /a2a/tasks<br/>Authorization: Bearer eyJhbG...<br/>Body: {"message": "What pipelines exist?"}
+
+      IAP->>IAP: Validate JWT token:<br/>1. Is signature valid? (Google-signed) ✓<br/>2. Is token expired? ✓<br/>3. Does "aud" match my client ID?<br/>
+  Token aud: 369001918367-...<br/>   My ID: ???<br/>   ❌ MISMATCH
+
+      IAP-->>Bot: HTTP 401<br/>Invalid IAP credentials:<br/>Invalid bearer token.<br/>Invalid JWT audience.
+
+      Note over IAP, Agent: ❌ REQUEST NEVER REACHES PIPELINE AGENT
+
+      Note over Bot, Agent: 4. IF IAP SUCCEEDS (expected flow)
+
+      rect rgb(200, 255, 200)
+          IAP->>Agent: Forward request<br/>(IAP adds X-Goog-IAP-JWT-Assertion header)
+          Agent->>Agent: Create task<br/>task_id: abc-123<br/>status: pending
+          Agent-->>IAP: {"task_id": "abc-123", "status": "pending"}
+          IAP-->>Bot: HTTP 200
+
+          Note over Bot, Agent: 5. POLLING LOOP
+
+          loop Poll every 2 seconds (max 60 attempts)
+              Bot->>IAP: GET /a2a/tasks/abc-123<br/>Authorization: Bearer eyJhbG...
+              IAP->>Agent: Forward request
+              Agent-->>IAP: {"status": "running", ...}
+              IAP-->>Bot: HTTP 200
+          end
+
+          Bot->>IAP: GET /a2a/tasks/abc-123
+          IAP->>Agent: Forward request
+          Agent-->>IAP: {"status": "completed",<br/>"messages": [{"content": "Found 5 pipelines..."}]}
+          IAP-->>Bot: HTTP 200
+      end
+
+      Note over User, Agent: 6. RESPONSE TO USER
+
+      Bot->>LLM: Tool result: "Found 5 pipelines..."
+      LLM->>LLM: Format response
+      LLM-->>Bot: Final answer
+      Bot->>User: "Here are the pipelines in DataHub 2.0:..."
+
+  ---
+  Where it breaks
+
+  flowchart LR
+      A[Our Bot] -->|"JWT token<br/>aud: 369001918367-..."| B{IAP Guard}
+      B -->|"aud matches my ID?"| C{Check}
+      C -->|"✓ Match"| D[Pipeline Agent]
+      C -->|"✗ Mismatch"| E["❌ HTTP 401<br/>Invalid JWT audience"]
+
+      style E fill:#ff6666,color:#fff
+      style D fill:#66cc66,color:#fff
+      style C fill:#ffcc00
